@@ -255,6 +255,10 @@ def build_app(state: StreamState, title: str) -> Dash:
             background: #0B1220;
             color: #E5E7EB;
           }
+          .dash-dropdown-value,
+          .dash-dropdown-value > * {
+            color: #102A43 !important;
+          }
         </style>
     </head>
     <body>
