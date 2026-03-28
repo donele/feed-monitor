@@ -18,7 +18,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, Optional
+from typing import Dict, Iterable, Optional, Tuple
 
 
 # Verified on this repo/build environment with a layout probe.
@@ -154,12 +154,26 @@ def detach_segment(layout: SegmentLayout) -> None:
         raise OSError(err, "shmdt failed")
 
 
-def load_symbol_map(refdata_path: Optional[str]) -> Dict[int, str]:
+def _refdata_multiplier(row: dict) -> float:
+    for key in ("contract_multiplier", "contract_size", "multiplier"):
+        raw = row.get(key)
+        if raw is None:
+            continue
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if val > 0.0:
+            return val
+    return 1.0
+
+
+def load_symbol_map(refdata_path: Optional[str]) -> Dict[int, Tuple[str, float]]:
     if not refdata_path:
         return {}
 
     data = json.loads(Path(refdata_path).read_text())
-    out: Dict[int, str] = {}
+    out: Dict[int, Tuple[str, float]] = {}
     if not isinstance(data, list):
         return out
 
@@ -172,13 +186,16 @@ def load_symbol_map(refdata_path: Optional[str]) -> Dict[int, str]:
         if sid is None:
             continue
         name = row.get("flat_id") or row.get("native_id") or row.get("name")
-        out[int(sid)] = str(name) if name is not None else str(sid)
+        out[int(sid)] = (
+            str(name) if name is not None else str(sid),
+            _refdata_multiplier(row),
+        )
     return out
 
 
 def iter_events(
     layout: SegmentLayout,
-    symbol_name_map: Dict[int, str],
+    symbol_meta_map: Dict[int, Tuple[str, float]],
     sleep_sec: float,
     symbol_filter: Optional[set[int]],
 ) -> Iterable[dict]:
@@ -264,12 +281,14 @@ def iter_events(
                 if symbol_filter and symbol_id not in symbol_filter:
                     continue
 
+                symbol_name, contract_multiplier = symbol_meta_map.get(symbol_id, (str(symbol_id), 1.0))
+
                 bid = bid_v * bid_incr
                 ask = ask_v * ask_incr
                 evt = {
                     "kind": "book_ticker",
                     "symbol_id": symbol_id,
-                    "symbol": symbol_name_map.get(symbol_id, str(symbol_id)),
+                    "symbol": symbol_name,
                     "exchange_time": exchange_time,
                     "sequencer_time_ns": sequencer_ts,
                     "seq": global_seq_no,
@@ -277,8 +296,9 @@ def iter_events(
                     "bid": bid,
                     "ask": ask,
                     "mid": (bid + ask) * 0.5,
-                    "bid_qty": bid_qty_v * bid_qty_incr,
-                    "ask_qty": ask_qty_v * ask_qty_incr,
+                    "bid_qty": bid_qty_v * bid_qty_incr * contract_multiplier,
+                    "ask_qty": ask_qty_v * ask_qty_incr * contract_multiplier,
+                    "contract_multiplier": contract_multiplier,
                     "update_id": update_id,
                 }
                 yield evt
@@ -305,16 +325,19 @@ def iter_events(
                 if symbol_filter and symbol_id not in symbol_filter:
                     continue
 
+                symbol_name, contract_multiplier = symbol_meta_map.get(symbol_id, (str(symbol_id), 1.0))
+
                 evt = {
                     "kind": "trade",
                     "symbol_id": symbol_id,
-                    "symbol": symbol_name_map.get(symbol_id, str(symbol_id)),
+                    "symbol": symbol_name,
                     "exchange_time": exchange_time,
                     "sequencer_time_ns": sequencer_ts,
                     "seq": global_seq_no,
                     "topic": topic,
                     "price": px_v * px_incr,
-                    "qty": qty_v * qty_incr,
+                    "qty": qty_v * qty_incr * contract_multiplier,
+                    "contract_multiplier": contract_multiplier,
                     "trade_id": trade_id,
                     "side": int(side),
                     "is_market_maker": bool(is_mm),
@@ -342,16 +365,19 @@ def iter_events(
                 if symbol_filter and symbol_id not in symbol_filter:
                     continue
 
+                symbol_name, contract_multiplier = symbol_meta_map.get(symbol_id, (str(symbol_id), 1.0))
+
                 evt = {
                     "kind": "incremental",
                     "symbol_id": symbol_id,
-                    "symbol": symbol_name_map.get(symbol_id, str(symbol_id)),
+                    "symbol": symbol_name,
                     "exchange_time": exchange_time,
                     "sequencer_time_ns": sequencer_ts,
                     "seq": global_seq_no,
                     "topic": topic,
                     "price": px_v * px_incr,
-                    "qty": qty_v * qty_incr,
+                    "qty": qty_v * qty_incr * contract_multiplier,
+                    "contract_multiplier": contract_multiplier,
                     "num_orders": num_orders,
                     "side": int(side),
                 }
@@ -380,7 +406,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    symbol_name_map = load_symbol_map(args.refdata)
+    symbol_meta_map = load_symbol_map(args.refdata)
     symbol_filter = set(args.symbol_id) if args.symbol_id else None
 
     stop = {"flag": False}
@@ -396,7 +422,7 @@ def main() -> int:
     try:
         for evt in iter_events(
             layout=layout,
-            symbol_name_map=symbol_name_map,
+            symbol_meta_map=symbol_meta_map,
             sleep_sec=max(args.sleep_ms, 0.0) / 1000.0,
             symbol_filter=symbol_filter,
         ):
