@@ -1,4 +1,4 @@
-# sgt-dashboard
+# crypto-feed-monitor
 
 Dash-based monitoring dashboard for real-time market data streamed from exchanges and published into SGT shared memory.
 
@@ -10,7 +10,7 @@ Dash-based monitoring dashboard for real-time market data streamed from exchange
 ## Install
 
 ```bash
-cd <your-repo-root>/sgt-dashboard
+cd <your-repo-root>/crypto-feed-monitor
 python3 -m pip install -e .
 ```
 
@@ -55,7 +55,7 @@ sgt-shm-reader --pathname <shm-pathname> --refdata /path/to/refdata.json
 ## Testing
 
 ```bash
-cd <your-repo-root>/sgt-dashboard
+cd <your-repo-root>/crypto-feed-monitor
 python3 -m pip install -r requirements.txt
 python3 -m pytest -q
 ```

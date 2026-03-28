@@ -3,7 +3,7 @@ requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "sgt-dashboard"
+name = "crypto-feed-monitor"
 version = "0.1.0"
 description = "Dash-based monitoring dashboard for SGT shared-memory market data"
 readme = "README.md"
