@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+from bisect import bisect_left
 import json
 import math
 import signal
@@ -14,11 +15,11 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Deque, Dict, List, Optional, Tuple
 
-from dash import Dash, Input, Output, dcc, html
+from dash import Dash, Input, Output, State, dcc, html, no_update
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
@@ -43,12 +44,21 @@ class StreamState:
         self.window_sec = window_sec
         self.retention_sec = retention_sec
         self.symbol_to_series: Dict[str, SymbolSeries] = {}
+        self.symbols_sorted: Tuple[str, ...] = ()
+        self.symbol_options: Tuple[dict, ...] = ()
+        self.symbol_version = 0
         self.last_event_time = 0.0
         self.events_total = 0
+
+    def _rebuild_symbol_cache(self) -> None:
+        self.symbols_sorted = tuple(sorted(self.symbol_to_series.keys()))
+        self.symbol_options = tuple({"label": sym, "value": sym} for sym in self.symbols_sorted)
+        self.symbol_version += 1
 
     def _get(self, symbol: str) -> SymbolSeries:
         if symbol not in self.symbol_to_series:
             self.symbol_to_series[symbol] = SymbolSeries()
+            self._rebuild_symbol_cache()
         return self.symbol_to_series[symbol]
 
     @staticmethod
@@ -99,7 +109,9 @@ class StreamState:
             out = {
                 "events_total": self.events_total,
                 "last_event_age_sec": (time.time() - self.last_event_time) if self.last_event_time else float("inf"),
-                "symbols": sorted(self.symbol_to_series.keys()),
+                "symbols": self.symbols_sorted,
+                "symbol_options": self.symbol_options,
+                "symbol_version": self.symbol_version,
                 "series": {},
             }
             for sym, s in self.symbol_to_series.items():
@@ -119,7 +131,7 @@ class StreamState:
 
     def snapshot_symbol(self, selected: Optional[str]) -> dict:
         with self._lock:
-            symbols = sorted(self.symbol_to_series.keys())
+            symbols = self.symbols_sorted
             selected_sym = selected if selected in self.symbol_to_series else (symbols[0] if symbols else None)
 
             series = None
@@ -142,6 +154,8 @@ class StreamState:
                 "events_total": self.events_total,
                 "last_event_age_sec": (time.time() - self.last_event_time) if self.last_event_time else float("inf"),
                 "symbols": symbols,
+                "symbol_options": self.symbol_options,
+                "symbol_version": self.symbol_version,
                 "selected": selected_sym,
                 "series": series,
             }
@@ -223,25 +237,13 @@ class ReaderProcess:
 
 
 def _window_points(ts: List[float], px: List[float], cutoff: float) -> Tuple[List[float], List[float]]:
-    out_t: List[float] = []
-    out_p: List[float] = []
-    for t, p in zip(ts, px):
-        if t >= cutoff:
-            out_t.append(t)
-            out_p.append(p)
-    return out_t, out_p
+    start = bisect_left(ts, cutoff)
+    return ts[start:], px[start:]
 
 
 def _window_trades(ts: List[float], px: List[float], qty: List[float], cutoff: float) -> Tuple[List[float], List[float], List[float]]:
-    out_t: List[float] = []
-    out_p: List[float] = []
-    out_q: List[float] = []
-    for t, p, q in zip(ts, px, qty):
-        if t >= cutoff:
-            out_t.append(t)
-            out_p.append(p)
-            out_q.append(q)
-    return out_t, out_p, out_q
+    start = bisect_left(ts, cutoff)
+    return ts[start:], px[start:], qty[start:]
 
 
 def _aggregate_trade_notional_1s(trade_ts: List[float], trade_px: List[float], trade_qty: List[float]) -> Tuple[List[datetime], List[float]]:
@@ -250,7 +252,7 @@ def _aggregate_trade_notional_1s(trade_ts: List[float], trade_px: List[float], t
         sec = int(t)
         buckets[sec] = buckets.get(sec, 0.0) + (p * q)
     secs = sorted(buckets.keys())
-    x = [datetime.fromtimestamp(sec) for sec in secs]
+    x = [_ts_to_plot_datetime(sec) for sec in secs]
     y = [buckets[sec] for sec in secs]
     return x, y
 
@@ -262,9 +264,13 @@ def _aggregate_trade_notional_bucket(trade_ts: List[float], trade_px: List[float
         bucket = (sec // bucket_sec) * bucket_sec
         buckets[bucket] = buckets.get(bucket, 0.0) + (p * q)
     secs = sorted(buckets.keys())
-    x = [datetime.fromtimestamp(sec) for sec in secs]
+    x = [_ts_to_plot_datetime(sec) for sec in secs]
     y = [buckets[sec] for sec in secs]
     return x, y
+
+
+def _ts_to_plot_datetime(ts: float) -> datetime:
+    return datetime.fromtimestamp(ts, tz=timezone.utc)
 
 
 def build_app(state: StreamState, title: str) -> Dash:
@@ -321,6 +327,7 @@ def build_app(state: StreamState, title: str) -> Dash:
                     dcc.Dropdown(id="symbol", options=[], value=None, clearable=False, style={"width": "420px", "borderRadius": "10px"}),
                 ],
             ),
+            dcc.Store(id="symbol-version", data=-1),
             dcc.Graph(id="price-graph", style={"height": "72vh", "borderRadius": "16px", "boxShadow": "0 12px 30px rgba(2, 6, 23, 0.55)", "background": "#121A2B"}),
             dcc.Graph(id="overview-graph", style={"height": "72vh", "display": "none", "borderRadius": "16px", "boxShadow": "0 12px 30px rgba(2, 6, 23, 0.55)", "background": "#121A2B"}),
             dcc.Interval(id="tick", interval=500, n_intervals=0),
@@ -330,6 +337,23 @@ def build_app(state: StreamState, title: str) -> Dash:
     @app.callback(
         Output("symbol", "options"),
         Output("symbol", "value"),
+        Output("symbol-version", "data"),
+        Input("tick", "n_intervals"),
+        Input("symbol", "value"),
+        State("symbol-version", "data"),
+    )
+    def refresh_symbol_controls(_n: int, selected: Optional[str], current_version: int):
+        snap = state.snapshot_symbol(selected)
+        options_out = no_update
+        version_out = no_update
+        if snap["symbol_version"] != current_version:
+            options_out = list(snap["symbol_options"])
+            version_out = snap["symbol_version"]
+
+        value_out = snap["selected"] if snap["selected"] != selected else no_update
+        return options_out, value_out, version_out
+
+    @app.callback(
         Output("status", "children"),
         Output("price-graph", "figure"),
         Output("overview-graph", "figure"),
@@ -339,20 +363,18 @@ def build_app(state: StreamState, title: str) -> Dash:
         Input("symbol", "value"),
         Input("window-select", "value"),
     )
-    def refresh(_n: int, selected: Optional[str], window_sel: str):
+    def refresh_charts(_n: int, selected: Optional[str], window_sel: str):
         snap = state.snapshot_symbol(selected)
         symbols = snap["symbols"]
-        options = [{"label": s, "value": s} for s in symbols]
 
         if not symbols:
             fig = go.Figure()
             fig.update_layout(template="plotly_white", title="Waiting for events from SHM...", paper_bgcolor="#0F172A", plot_bgcolor="#111827", font={"color": "#D7E2F0"})
             status = "events=0 | waiting for first packet"
             if window_sel == "10m":
-                return options, None, status, fig, fig, {"height": "72vh", "display": "none", "borderRadius": "16px", "boxShadow": "0 12px 30px rgba(2, 6, 23, 0.55)", "background": "#121A2B"}, {"height": "72vh", "borderRadius": "16px", "boxShadow": "0 12px 30px rgba(2, 6, 23, 0.55)", "background": "#121A2B"}
-            return options, None, status, fig, fig, {"height": "72vh", "borderRadius": "16px", "boxShadow": "0 12px 30px rgba(2, 6, 23, 0.55)", "background": "#121A2B"}, {"height": "72vh", "display": "none", "borderRadius": "16px", "boxShadow": "0 12px 30px rgba(2, 6, 23, 0.55)", "background": "#121A2B"}
+                return status, no_update, fig, {"height": "72vh", "display": "none", "borderRadius": "16px", "boxShadow": "0 12px 30px rgba(2, 6, 23, 0.55)", "background": "#121A2B"}, {"height": "72vh", "borderRadius": "16px", "boxShadow": "0 12px 30px rgba(2, 6, 23, 0.55)", "background": "#121A2B"}
+            return status, fig, no_update, {"height": "72vh", "borderRadius": "16px", "boxShadow": "0 12px 30px rgba(2, 6, 23, 0.55)", "background": "#121A2B"}, {"height": "72vh", "display": "none", "borderRadius": "16px", "boxShadow": "0 12px 30px rgba(2, 6, 23, 0.55)", "background": "#121A2B"}
 
-        selected = snap["selected"]
         s = snap["series"]
 
         latest_candidates: List[float] = []
@@ -364,60 +386,11 @@ def build_app(state: StreamState, title: str) -> Dash:
             latest_candidates.append(s["trade_ts"][-1])
         latest_ts = max(latest_candidates) if latest_candidates else time.time()
 
-        # 1m chart
-        main_window_sec = 60.0
-        cutoff = latest_ts - main_window_sec
-
-        bid_t, bid_p = _window_points(s["bid_ts"], s["bid_px"], cutoff)
-        ask_t, ask_p = _window_points(s["ask_ts"], s["ask_px"], cutoff)
-        trd_t, trd_p, trd_q = _window_trades(s["trade_ts"], s["trade_px"], s["trade_qty"], cutoff)
-
-        bid_x = [datetime.fromtimestamp(t) for t in bid_t]
-        ask_x = [datetime.fromtimestamp(t) for t in ask_t]
-        trd_x = [datetime.fromtimestamp(t) for t in trd_t]
-        cutoff_dt = datetime.fromtimestamp(cutoff)
-        latest_dt = datetime.fromtimestamp(latest_ts)
-
-        bar_x, bar_y = _aggregate_trade_notional_1s(trd_t, trd_p, trd_q)
-
-        fig = make_subplots(
-            rows=2,
-            cols=1,
-            shared_xaxes=True,
-            vertical_spacing=0.03,
-            row_heights=[0.76, 0.24],
-        )
-
-        if bid_t:
-            fig.add_trace(go.Scatter(x=bid_x, y=bid_p, mode="lines", name="bid", line={"width": 2.0, "shape": "hv", "color": "#2DD4BF"}), row=1, col=1)
-        if ask_t:
-            fig.add_trace(go.Scatter(x=ask_x, y=ask_p, mode="lines", name="ask", line={"width": 2.0, "shape": "hv", "color": "#FB7185"}), row=1, col=1)
-        if trd_t:
-            fig.add_trace(go.Scatter(x=trd_x, y=trd_p, mode="markers", name="trades", marker={"size": 5, "color": "#60A5FA", "opacity": 0.8}), row=1, col=1)
-
-        if bar_x:
-            fig.add_trace(go.Bar(x=bar_x, y=bar_y, name="trade notional USD / 1s", width=1000, marker={"color": "#60A5FA", "opacity": 0.85}), row=2, col=1)
-
-        fig.update_layout(
-            template="plotly_white",
-            paper_bgcolor="#0F172A",
-            plot_bgcolor="#111827",
-            font={"color": "#D7E2F0"},
-            margin={"l": 40, "r": 10, "t": 30, "b": 40},
-            legend={"orientation": "h", "y": 1.03, "x": 0.0, "bgcolor": "rgba(17,24,39,0.75)"},
-            hovermode="x unified",
-            xaxis={"range": [cutoff_dt, latest_dt], "tickformat": "%H:%M:%S"},
-            xaxis2={"range": [cutoff_dt, latest_dt], "tickformat": "%H:%M:%S", "title": "time"},
-        )
-        fig.update_yaxes(title_text="price", row=1, col=1, gridcolor="#243042", zeroline=False)
-        fig.update_yaxes(title_text="notional USD", row=2, col=1, gridcolor="#243042", zeroline=False)
-        fig.update_xaxes(showgrid=True, gridcolor="#1F2A3D")
-
-        # 10m chart
+        latest_dt = _ts_to_plot_datetime(latest_ts)
         overview_window_sec = 600.0
         overview_bucket_sec = 10
         overview_cutoff = latest_ts - overview_window_sec
-        overview_cutoff_dt = datetime.fromtimestamp(overview_cutoff)
+        overview_cutoff_dt = _ts_to_plot_datetime(overview_cutoff)
 
         obid_t, obid_p = _window_points(s["bid_ts"], s["bid_px"], overview_cutoff)
         oask_t, oask_p = _window_points(s["ask_ts"], s["ask_px"], overview_cutoff)
@@ -426,11 +399,11 @@ def build_app(state: StreamState, title: str) -> Dash:
         n_mid = min(len(obid_t), len(oask_t))
         mid_t = obid_t[:n_mid]
         mid_p = [(obid_p[i] + oask_p[i]) * 0.5 for i in range(n_mid)]
-        mid_x = [datetime.fromtimestamp(t) for t in mid_t]
+        mid_x = [_ts_to_plot_datetime(t) for t in mid_t]
 
         vol_x, vol_y = _aggregate_trade_notional_bucket(otrd_t, otrd_p, otrd_q, overview_bucket_sec)
 
-        overview_fig = go.Figure()
+        overview_fig = no_update
         if window_sel == "10m":
             overview_fig = make_subplots(
                 rows=2,
@@ -453,14 +426,12 @@ def build_app(state: StreamState, title: str) -> Dash:
                 margin={"l": 40, "r": 10, "t": 30, "b": 40},
                 legend={"orientation": "h", "y": 1.03, "x": 0.0, "bgcolor": "rgba(17,24,39,0.75)"},
                 hovermode="x unified",
-                xaxis={"range": [overview_cutoff_dt, latest_dt], "tickformat": "%H:%M:%S"},
-                xaxis2={"range": [overview_cutoff_dt, latest_dt], "tickformat": "%H:%M:%S", "title": "time"},
+                xaxis={"range": [overview_cutoff_dt, latest_dt], "tickformat": "%H:%M:%S", "hoverformat": "%Y-%m-%d %H:%M:%S UTC"},
+                xaxis2={"range": [overview_cutoff_dt, latest_dt], "tickformat": "%H:%M:%S", "hoverformat": "%Y-%m-%d %H:%M:%S UTC", "title": "time (UTC)"},
             )
             overview_fig.update_yaxes(title_text="mid price", row=1, col=1, gridcolor="#243042", zeroline=False)
             overview_fig.update_yaxes(title_text="notional USD", row=2, col=1, gridcolor="#243042", zeroline=False)
             overview_fig.update_xaxes(showgrid=True, gridcolor="#1F2A3D")
-
-        active_window = 600 if window_sel == "10m" else 60
 
         # Last known bid/ask spread in bps.
         spread_bps = float("nan")
@@ -506,6 +477,7 @@ def build_app(state: StreamState, title: str) -> Dash:
         vol_pct = vol_bps / 100.0
         vol_txt = "na" if math.isnan(vol_bps) else f"{vol_pct:.1f}%"
         est_24h_txt = "na" if math.isnan(est_24h_notional) else f"{est_24h_notional:,.0f}"
+        last_update_txt = latest_dt.strftime("%Y-%m-%d %H:%M")
 
         age = snap["last_event_age_sec"]
         age_txt = "inf" if age == float("inf") else f"{age * 1000.0:.1f}ms"
@@ -515,13 +487,60 @@ def build_app(state: StreamState, title: str) -> Dash:
             f"bid_ask_spread={spread_txt} | "
             f"volatility={vol_txt} | "
             f"last_seq={s['last_seq']} | "
+            f"last_update={last_update_txt} | "
             f"last_event_age={age_txt}"
         )
 
         if window_sel == "10m":
-            return options, selected, status, fig, overview_fig, {"height": "72vh", "display": "none", "borderRadius": "16px", "boxShadow": "0 12px 30px rgba(2, 6, 23, 0.55)", "background": "#121A2B"}, {"height": "72vh", "borderRadius": "16px", "boxShadow": "0 12px 30px rgba(2, 6, 23, 0.55)", "background": "#121A2B"}
+            return status, no_update, overview_fig, {"height": "72vh", "display": "none", "borderRadius": "16px", "boxShadow": "0 12px 30px rgba(2, 6, 23, 0.55)", "background": "#121A2B"}, {"height": "72vh", "borderRadius": "16px", "boxShadow": "0 12px 30px rgba(2, 6, 23, 0.55)", "background": "#121A2B"}
 
-        return options, selected, status, fig, overview_fig, {"height": "72vh", "borderRadius": "16px", "boxShadow": "0 12px 30px rgba(2, 6, 23, 0.55)", "background": "#121A2B"}, {"height": "72vh", "display": "none", "borderRadius": "16px", "boxShadow": "0 12px 30px rgba(2, 6, 23, 0.55)", "background": "#121A2B"}
+        main_window_sec = 60.0
+        cutoff = latest_ts - main_window_sec
+        cutoff_dt = _ts_to_plot_datetime(cutoff)
+
+        bid_t, bid_p = _window_points(s["bid_ts"], s["bid_px"], cutoff)
+        ask_t, ask_p = _window_points(s["ask_ts"], s["ask_px"], cutoff)
+        trd_t, trd_p, trd_q = _window_trades(s["trade_ts"], s["trade_px"], s["trade_qty"], cutoff)
+
+        bid_x = [_ts_to_plot_datetime(t) for t in bid_t]
+        ask_x = [_ts_to_plot_datetime(t) for t in ask_t]
+        trd_x = [_ts_to_plot_datetime(t) for t in trd_t]
+        bar_x, bar_y = _aggregate_trade_notional_1s(trd_t, trd_p, trd_q)
+
+        fig = make_subplots(
+            rows=2,
+            cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.03,
+            row_heights=[0.76, 0.24],
+        )
+
+        if bid_t:
+            fig.add_trace(go.Scatter(x=bid_x, y=bid_p, mode="lines", name="bid", line={"width": 2.0, "shape": "hv", "color": "#2DD4BF"}), row=1, col=1)
+        if ask_t:
+            fig.add_trace(go.Scatter(x=ask_x, y=ask_p, mode="lines", name="ask", line={"width": 2.0, "shape": "hv", "color": "#FB7185"}), row=1, col=1)
+        if trd_t:
+            fig.add_trace(go.Scatter(x=trd_x, y=trd_p, mode="markers", name="trades", marker={"size": 5, "color": "#60A5FA", "opacity": 0.8}), row=1, col=1)
+
+        if bar_x:
+            fig.add_trace(go.Bar(x=bar_x, y=bar_y, name="trade notional USD / 1s", width=1000, marker={"color": "#60A5FA", "opacity": 0.85}), row=2, col=1)
+
+        fig.update_layout(
+            template="plotly_white",
+            paper_bgcolor="#0F172A",
+            plot_bgcolor="#111827",
+            font={"color": "#D7E2F0"},
+            margin={"l": 40, "r": 10, "t": 30, "b": 40},
+            legend={"orientation": "h", "y": 1.03, "x": 0.0, "bgcolor": "rgba(17,24,39,0.75)"},
+            hovermode="x unified",
+            xaxis={"range": [cutoff_dt, latest_dt], "tickformat": "%H:%M:%S", "hoverformat": "%Y-%m-%d %H:%M:%S UTC"},
+            xaxis2={"range": [cutoff_dt, latest_dt], "tickformat": "%H:%M:%S", "hoverformat": "%Y-%m-%d %H:%M:%S UTC", "title": "time (UTC)"},
+        )
+        fig.update_yaxes(title_text="price", row=1, col=1, gridcolor="#243042", zeroline=False)
+        fig.update_yaxes(title_text="notional USD", row=2, col=1, gridcolor="#243042", zeroline=False)
+        fig.update_xaxes(showgrid=True, gridcolor="#1F2A3D")
+
+        return status, fig, no_update, {"height": "72vh", "borderRadius": "16px", "boxShadow": "0 12px 30px rgba(2, 6, 23, 0.55)", "background": "#121A2B"}, {"height": "72vh", "display": "none", "borderRadius": "16px", "boxShadow": "0 12px 30px rgba(2, 6, 23, 0.55)", "background": "#121A2B"}
 
     return app
 
